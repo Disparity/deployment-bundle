@@ -12,6 +12,7 @@ use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Output\BufferedOutput;
 use Symfony\Component\Process\ProcessBuilder;
+use Doctrine\Bundle\DoctrineBundle\Command\Proxy\DoctrineCommandHelper;
 
 
 /**
@@ -20,7 +21,7 @@ class MigrateCommand extends ContainerAwareCommand
 {
 
 	/**
-	 * @var DoctrineMigrationConfiguration 
+	 * @var DoctrineMigrationConfiguration
 	 */
 	private $doctrineMigrationConfiguration;
 
@@ -37,6 +38,16 @@ class MigrateCommand extends ContainerAwareCommand
 				->addOption('clean-working-copy', null, InputOption::VALUE_NONE, 'Clean working copy: remove local changes, prune remote branches and remove other local branches.')
 				->addArgument('hash', InputArgument::OPTIONAL, 'Tag/branch name or commit hash. If not specified then update current branch')
 		;
+	}
+
+
+	/**
+	 * @inheritdoc
+	 */
+	protected function initialize(InputInterface $input, OutputInterface $output)
+	{
+		parent::initialize($input, $output);
+		DoctrineCommandHelper::setApplicationConnection($this->getApplication(), null);
 	}
 
 
@@ -80,20 +91,20 @@ class MigrateCommand extends ContainerAwareCommand
 			$this->runProcess(['git', 'checkout', '-f', $destination[2]], $output);
 		}
 
-		if ($sqlBuffer) {
-			$newMigrationsSQL = implode(", ", array_map(function ($version) {return "('{$version}')";}, $this->findNewMigration()));
-			$this->runCommand('doctrine:migration:migrate', ['--write-sql' => $tmp = tempnam(sys_get_temp_dir(), ''),], $input, $output);
-			stream_copy_to_stream(fopen($tmp, 'r'), $sqlBuffer);
-			if ($newMigrationsSQL) {
+		$newMigrationsSQL = implode(", ", array_map(function ($version) {return "('{$version}')";}, $this->findNewMigration()));
+		if ($newMigrationsSQL) {
+			if ($sqlBuffer) {
+				$this->runCommand('doctrine:migration:migrate', ['--write-sql' => $tmp = tempnam(sys_get_temp_dir(), ''),], $input, $output);
+				stream_copy_to_stream(fopen($tmp, 'r'), $sqlBuffer);
 				fwrite($sqlBuffer, "INSERT INTO `{$this->getDMC()->getMigrationsTableName()}` (`version`) VALUES {$newMigrationsSQL}");
+			} else {
+				$this->runCommand('doctrine:migration:migrate', [], $input, $output);
 			}
-		} else {
-			$this->runCommand('doctrine:migration:migrate', [], $input, $output);
 		}
 
 		if ($input->getOption('clean-working-copy')) { // Remove local branches
 			foreach ($this->runProcess(['git', 'rev-parse', '--abbrev-ref', "--branches=*"]) as $branch) {
-				if ($destination[1] === $branch) {
+				if ($destination[0] === 'branch' && $destination[3] === $branch) { // exclude current branch
 					continue;
 				}
 				$this->runProcess(['git', 'branch', '-D', $branch]);
@@ -110,14 +121,22 @@ class MigrateCommand extends ContainerAwareCommand
 
 		if ($sqlBuffer) {
 			rewind($sqlBuffer);
-			$output->writeln('<info> == Doctrine Migration sql queries ==</info>');
+			$output->writeln("\n<info> == Doctrine Migration sql queries ==</info>");
 			$output->writeln(stream_get_contents($sqlBuffer));
 			fclose($sqlBuffer);
 		}
 
-		// @todo check and display warning if deployment bundle not exists after composer install
+		if (!in_array('disparity/deployment-bundle', $this->runProcess(['composer', 'show', '--installed', '--name-only']))) {
+			$messages[] = str_pad('     Warning!', 85);
+			$messages[] = str_pad('', 85);
+			$messages[] = '  Package <info>disparity/deployment-bundle</info> is not found in list of installed packages.    ';
+			$messages[] = '  Command <info>disparity:deployment:migrate</info> is not available.                             ' . PHP_EOL;
+			foreach ($messages as $message) {
+				$output->writeln("<error>{$message}</error>");
+			}
+		}
 
-		$output->writeln("<info>Migrated to {$destination[0]}: {$destination[2]}</info>");
+		$output->writeln("\n<info>Migrated to {$destination[0]}: {$destination[2]}</info>");
 	}
 
 
@@ -161,10 +180,13 @@ class MigrateCommand extends ContainerAwareCommand
 	 */
 	private function findRemovedMigration($from, $to)
 	{
+		$this->doctrineMigrationConfiguration = null;
+		DoctrineCommand::configureMigrations($this->getContainer(), $this->getDMC());
+
 		$migrations = array_map(function($path) {
 			return substr(pathinfo($path, PATHINFO_FILENAME), 7); // Version*
 		}, $this->runProcess(['git', 'diff', '--diff-filter=DM', '--name-only', '--summary', $from, $to, '--', $this->getDMC()->getMigrationsDirectory()]));
-		$migrations = array_diff($migrations, $this->getDMC()->getMigratedVersions());
+		$migrations = array_intersect($migrations, $this->getDMC()->getMigratedVersions());
 		rsort($migrations);
 		return $migrations;
 	}
@@ -175,7 +197,8 @@ class MigrateCommand extends ContainerAwareCommand
 	 */
 	private function findNewMigration()
 	{
-		$this->getDMC()->registerMigrationsFromDirectory($this->getDMC()->getMigrationsDirectory());
+		$this->doctrineMigrationConfiguration = null;
+		DoctrineCommand::configureMigrations($this->getContainer(), $this->getDMC());
 		return array_keys($this->getDMC()->getMigrationsToExecute('up', $this->getDMC()->getLatestVersion()));
 	}
 
@@ -187,10 +210,9 @@ class MigrateCommand extends ContainerAwareCommand
 	{
 		if (!$this->doctrineMigrationConfiguration) {
 			if (!$this->getApplication()->getHelperSet()->has('connection')) {
-				throw \Exception('Database connection not exists.'); // @todo fix exception class
+				throw new \Exception('Database connection not exists.'); // @todo fix exception class
 			}
 			$this->doctrineMigrationConfiguration = new DoctrineMigrationConfiguration($this->getHelper('connection')->getConnection());
-			DoctrineCommand::configureMigrations($this->getContainer(), $this->doctrineMigrationConfiguration);
 		}
 		return $this->doctrineMigrationConfiguration;
 	}
@@ -199,12 +221,12 @@ class MigrateCommand extends ContainerAwareCommand
 	/**
 	 * @param array $args
 	 * @param OutputInterface $output
-	 * @return string[]
+	 * @return string[]|null
 	 */
 	private function runProcess(array $args, OutputInterface $output = null)
 	{
 		$output = $output ? : new BufferedOutput();
-		ProcessBuilder::create(array_filter('is_null', $args))->getProcess()->mustRun(function ($type, $data) use($output) {
+		ProcessBuilder::create(array_filter($args, function($v) {return !is_null($v);}))->getProcess()->mustRun(function ($type, $data) use($output) {
 			$output->write($data);
 		});
 		return $output instanceof BufferedOutput ? $this->extractResult($output) : null;
@@ -214,23 +236,29 @@ class MigrateCommand extends ContainerAwareCommand
 	/**
 	 * @param string $commandName
 	 * @param array $options
-	 * @param InputInterface $input
+	 * @param InputInterface $parentInput
 	 * @param OutputInterface $output [OPTIONAL]
-	 * @return string[]|void
+	 * @return string[]|null
 	 * @throws \Exception
 	 */
-	private function runCommand($commandName, array $options, InputInterface $input, OutputInterface $output = null)
+	private function runCommand($commandName, array $options, InputInterface $parentInput, OutputInterface $output = null)
 	{
-		$output = $output ? : new BufferedOutput();
-		$exitCode = $this->getApplication()->find($commandName)->run(new ArrayInput(['command' => $commandName,] + $options + [
-			'--no-interaction' => $input->getOption('no-interaction'),
-			'--env'            => $input->getOption('env'),
-			'--verbose'        => $input->getOption('verbose'),
-		]), $output);
-		if ($exitCode === 0) {
-			return $output instanceof BufferedOutput ? $this->extractResult($output) : null;
+		if (strpos($commandName, 'doctrine:migration') === 0) { // avoid double initialization config in symfony doctrine command. Need refactoring
+			$this->doctrineMigrationConfiguration = null;
+			$this->getApplication()->find($commandName)->setMigrationConfiguration($this->getDMC());
 		}
-		throw new \Exception("The command \"{$commandName}\" failed.'\nExit Code: {$exitCode}"); // @todo fix exception class
+		$output = $output ? : new BufferedOutput();
+		$input = new ArrayInput(['command' => $commandName,] + $options + [
+			'--no-interaction' => $parentInput->getOption('no-interaction'),
+			'--env'            => $parentInput->getOption('env'),
+			'--verbose'        => $parentInput->getOption('verbose'),
+		]);
+		$input->setInteractive(!$parentInput->getOption('no-interaction'));
+
+		if (($exitCode = $this->getApplication()->find($commandName)->run($input, $output)) !== 0) {
+			throw new \Exception("The command \"{$commandName}\" failed.'\nExit Code: {$exitCode}"); // @todo fix exception class
+		}
+		return $output instanceof BufferedOutput ? $this->extractResult($output) : null;
 	}
 
 

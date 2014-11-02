@@ -1,7 +1,7 @@
 {
 	"name": "disparity/deployment-bundle",
 	"description": "Symfony 2 Bundle for easy migration to the specified commit / tag / branch execution (and revert) migration doctrine and installing dependencies",
-	"keywords": ["doctrine-migration", "deployment"],
+	"keywords": ["doctrine-migration", "deployment", "deploy", "migration"],
 	"type": "symfony-bundle",
 	"homepage": "https://github.com/Disparity/deployment-bundle/",
 	"issues": "https://github.com/Disparity/deployment-bundle/issues",
